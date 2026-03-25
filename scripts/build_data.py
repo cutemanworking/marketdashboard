@@ -16,14 +16,9 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from scipy.stats import rankdata
-
-try:
-    import investpy
-except ImportError:
-    investpy = None
 
 # --- Config: no Liquid Stocks ---
 KEY_EVENTS = [
@@ -144,33 +139,6 @@ def get_leveraged_etfs(ticker):
         return LEVERAGED_ETFS[ticker].get("long", []), LEVERAGED_ETFS[ticker].get("short", [])
     return [], []
 
-
-def get_upcoming_key_events(days_ahead=7):
-    if investpy is None:
-        return []
-    today = datetime.today()
-    end_date = today + timedelta(days=days_ahead)
-    from_date = today.strftime('%d/%m/%Y')
-    to_date = end_date.strftime('%d/%m/%Y')
-    try:
-        calendar = investpy.news.economic_calendar(
-            time_zone=None, time_filter='time_only', countries=['united states'],
-            importances=['high'], categories=None, from_date=from_date, to_date=to_date
-        )
-        if calendar.empty:
-            return []
-        pattern = '|'.join(KEY_EVENTS)
-        filtered = calendar[
-            (calendar['event'].str.contains(pattern, case=False, na=False)) &
-            (calendar['importance'].str.lower() == 'high')
-        ]
-        if filtered.empty:
-            return []
-        filtered = filtered.sort_values(['date', 'time'])
-        return filtered[['date', 'time', 'event']].to_dict('records')
-    except Exception as e:
-        print("Economic calendar error:", e)
-        return []
 
 
 def calculate_atr(hist_data, period=14):
@@ -333,6 +301,101 @@ def get_stock_data(ticker_symbol, charts_dir):
         return None
 
 
+# --- ETF Holdings Fetcher ---
+def get_all_etfs():
+    """Collect all ETFs from STOCK_GROUPS."""
+    etfs = set()
+    for group, tickers in STOCK_GROUPS.items():
+        etfs.update(tickers)
+    return sorted(etfs)
+
+
+def fetch_etf_holdings(etf_list, out_dir):
+    """
+    Fetch top 10 holdings for each ETF using yfinance.
+    Saves to data/holdings/{ETF}.json
+    """
+    holdings_dir = os.path.join(out_dir, "holdings")
+    os.makedirs(holdings_dir, exist_ok=True)
+
+    print(f"\nFetching ETF holdings for {len(etf_list)} ETFs...")
+
+    for i, etf_symbol in enumerate(etf_list):
+        try:
+            ticker = yf.Ticker(etf_symbol)
+            holdings_data = ticker.funds_data.top_holdings
+
+            # Handle pandas DataFrame - check if it's empty properly
+            has_holdings = False
+            try:
+                if holdings_data is not None and len(holdings_data) > 0:
+                    has_holdings = True
+            except:
+                has_holdings = False
+
+            if has_holdings:
+                holdings = []
+                for idx, item in holdings_data.head(10).iterrows():
+                    # Handle different column names from yfinance
+                    # Symbol can be in the index or in a "Symbol" column
+                    holding_symbol = str(idx) if idx else ""
+                    if not holding_symbol or holding_symbol == "nan":
+                        holding_symbol = str(item.get("Symbol", item.get("name", "")))
+                    weight = item.get("Holding Percent", item.get("weight"))
+                    if weight is not None:
+                        try:
+                            weight = float(weight)
+                        except (ValueError, TypeError):
+                            weight = None
+                    holdings.append({
+                        "symbol": holding_symbol,
+                        "weight": weight
+                    })
+
+                output_path = os.path.join(holdings_dir, f"{etf_symbol}.json")
+                with open(output_path, "w", encoding="utf-8") as f:
+                    json.dump({"symbol": etf_symbol, "holdings": holdings}, f, ensure_ascii=False, indent=2)
+                print(f"  [{i+1}/{len(etf_list)}] {etf_symbol}: {len(holdings)} holdings saved")
+            else:
+                # Try to get holdings from info
+                info = ticker.info
+                if info and 'topHoldings' in info:
+                    top_holdings = info.get('topHoldings', [])
+                    if top_holdings and len(top_holdings) > 0:
+                        holdings = []
+                        for h in top_holdings[:10]:
+                            holdings.append({
+                                "symbol": h.get("symbol", ""),
+                                "weight": h.get("weight", None)
+                            })
+                        output_path = os.path.join(holdings_dir, f"{etf_symbol}.json")
+                        with open(output_path, "w", encoding="utf-8") as f:
+                            json.dump({"symbol": etf_symbol, "holdings": holdings}, f, ensure_ascii=False, indent=2)
+                        print(f"  [{i+1}/{len(etf_list)}] {etf_symbol}: {len(holdings)} holdings saved (from info)")
+                    else:
+                        print(f"  [{i+1}/{len(etf_list)}] {etf_symbol}: No holdings data")
+                else:
+                    print(f"  [{i+1}/{len(etf_list)}] {etf_symbol}: No holdings data")
+
+            time.sleep(0.3)
+
+        except Exception as e:
+            print(f"  [{i+1}/{len(etf_list)}] {etf_symbol}: Error - {str(e)}")
+
+    print(f"\nETF holdings saved to {holdings_dir}/")
+
+
+def main_holdings():
+    """Standalone main for fetching ETF holdings."""
+    parser = argparse.ArgumentParser(description="Fetch ETF holdings data")
+    parser.add_argument("--out-dir", default="data", help="Output directory")
+    parser.add_argument("--holdings", action="store_true", help="Fetch ETF holdings")
+    args = parser.parse_args()
+
+    etfs = get_all_etfs()
+    fetch_etf_holdings(etfs, args.out_dir)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir", default="data", help="Output directory (default: data)")
@@ -340,9 +403,6 @@ def main():
     out_dir = args.out_dir
     charts_dir = os.path.join(out_dir, "charts")
     os.makedirs(charts_dir, exist_ok=True)
-
-    print("Fetching economic events...")
-    events = get_upcoming_key_events()
 
     print("Fetching stock data (no Liquid Stocks)...")
     groups_data = {}
@@ -373,7 +433,7 @@ def main():
         }
 
     snapshot = {
-        "built_at": datetime.utcnow().isoformat() + "Z",
+        "built_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "groups": groups_data,
         "column_ranges": column_ranges,
     }
@@ -386,18 +446,24 @@ def main():
     }
 
     snapshot_path = os.path.join(out_dir, "snapshot.json")
-    events_path = os.path.join(out_dir, "events.json")
     meta_path = os.path.join(out_dir, "meta.json")
 
     with open(snapshot_path, "w", encoding="utf-8") as f:
         json.dump(snapshot, f, ensure_ascii=False, indent=2)
-    with open(events_path, "w", encoding="utf-8") as f:
-        json.dump(events, f, ensure_ascii=False, indent=2)
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    print("Wrote", snapshot_path, events_path, meta_path, "and charts in", charts_dir)
+    print("Wrote", snapshot_path, meta_path, "and charts in", charts_dir)
+
+    # Also fetch ETF holdings automatically
+    print("\nFetching ETF holdings...")
+    etfs = get_all_etfs()
+    fetch_etf_holdings(etfs, out_dir)
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--holdings":
+        main_holdings()
+    else:
+        main()
