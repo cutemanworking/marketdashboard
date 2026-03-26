@@ -3,8 +3,8 @@ name: Refresh dashboard data
 
 on:
   schedule:
-    # Run every 30 mins covering US Market Open to Close (13:00-21:30 UTC) Mon-Fri
-    - cron: '0,30 13-21 * * 1-5'
+    # Run every 15 mins covering US Market Open to Close (13:00-21:30 UTC) Mon-Fri
+    - cron: '*/15 13-21 * * 1-5'
   workflow_dispatch: # Allow manual run
 
 jobs:
